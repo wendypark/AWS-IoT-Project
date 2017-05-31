@@ -13,8 +13,9 @@ ORDERED_OBJS += \
 "./gpio_if.obj" \
 "./main.obj" \
 "./network_common.obj" \
-"./pinmux.obj" \
+"./pin_mux_config.obj" \
 "./startup_ccs.obj" \
+"./timer_if.obj" \
 "./uart_if.obj" \
 "../cc3200v1p32.cmd" \
 $(GEN_CMDS__FLAG) \
@@ -161,8 +162,8 @@ SSL_REST_API_AWS.bin: $(EXE_OUTPUTS)
 # Other Targets
 clean:
 	-$(RM) $(BIN_OUTPUTS__QUOTED)$(EXE_OUTPUTS__QUOTED)
-	-$(RM) "gpio_if.obj" "main.obj" "network_common.obj" "pinmux.obj" "startup_ccs.obj" "uart_if.obj" 
-	-$(RM) "gpio_if.d" "main.d" "network_common.d" "pinmux.d" "startup_ccs.d" "uart_if.d" 
+	-$(RM) "gpio_if.obj" "main.obj" "network_common.obj" "pin_mux_config.obj" "startup_ccs.obj" "timer_if.obj" "uart_if.obj" 
+	-$(RM) "gpio_if.d" "main.d" "network_common.d" "pin_mux_config.d" "startup_ccs.d" "timer_if.d" "uart_if.d" 
 	-@echo 'Finished clean'
 	-@echo ' '
 

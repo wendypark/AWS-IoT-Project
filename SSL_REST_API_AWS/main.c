@@ -69,9 +69,14 @@
 #include "prcm.h"
 #include "utils.h"
 #include "uart.h"
+#include "gpio.h"
+#include "timer_if.h"
+#include "spi.h"
+#include "timer.h"
+#include "hw_memmap.h"
 
 //Common interface includes
-#include "pinmux.h"
+#include "pin_mux_config.h"
 #include "gpio_if.h"
 #include "common.h"
 #include "uart_if.h"
@@ -105,7 +110,12 @@
 #define CLHEADER1 "Content-Length: "
 #define CLHEADER2 "\r\n\r\n"
 
-#define DATA1 "{\"state\": {\n\r\"desired\" : {\n\r\"messageagain\" : \"Hello, this is Wendy!\"\r\n}}}\r\n\r\n"
+//#define DATA1 "{\"state\": {\n\r\"desired\" : {\n\r\"messageagain\" : \"""
+//#define DATA2 "\r\n}}}\r\n\r\n"
+#define DATA1 "{\"state\": {\n\r\"desired\" : {\n\r\"messageagain\" : \"" //\"Hello, this is Wendy!\"
+#define DATA2 "\"\r\n}}}\r\n\r\n"
+#define SPI_IF_BIT_RATE  100000
+#define MASTER_MODE      0
 
 // Application specific status/error codes
 typedef enum{
@@ -149,10 +159,82 @@ extern void (* const g_pfnVectors[])(void);
 #if defined(ewarm)
 extern uVectorEntry __vector_table;
 #endif
+
+// button bit patterns: stored in an array of arrays
+// index is the button number
+// index 10 = mute; index 11 = last/enter
+int patterns[25][12] = {
+    {0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0} ,
+    {0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0} ,
+    {0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1} ,
+    {0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1} ,
+    {0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1} ,
+    {0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 1} ,
+    {0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0} ,
+    {0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0} ,
+    {0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0} ,
+    {0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 1, 0} ,
+    {0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0} ,
+    {0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 1, 0} ,
+    {0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0} ,
+    {0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0} ,
+    {0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0} ,
+    {0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0} ,
+    {0, 1, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0} ,
+    {0, 0, 1, 0, 0, 0, 0, 0, 1, 1, 0, 0} ,
+    {0, 1, 0, 0, 0, 0, 0, 0, 1, 1, 1, 0} ,
+    {0, 0, 1, 0, 0, 0, 0, 0, 1, 1, 1, 0} ,
+    {0, 1, 0, 0, 0, 0, 0, 0, 1, 1, 1, 0} ,
+    {0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 1, 0} ,
+    {0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 1, 0} ,
+    {0, 0, 1, 0, 0, 0, 1, 1, 0, 0, 0, 0} ,
+    {0, 1, 0, 0, 0, 0, 1, 1, 0, 1, 0, 0}
+};
+
+// char array of arrays to keep hold all the characters
+char letters[9][4] = {
+    {' ', ' ', ' ', ' '} ,
+    {'J', 'K', 'L', '0'} ,
+    {'A', 'B', 'C', '0'} ,
+    {'D', 'E', 'F', '0'} ,
+    {'G', 'H', 'I', '0'} ,
+    {'M', 'N', 'O', '0'} ,
+    {'P', 'Q', 'R', 'S'} ,
+    {'T', 'U', 'V', '0'} ,
+    {'W', 'X', 'Y', 'Z'}
+};
+
+// variables to keep track of character display per button press
+int char_i;
+int prev_button;
+
+//array to compare received signals to bit patterns
+int checker[12] = {};
+
+// variables to get bits from input
+volatile unsigned long start;
+volatile unsigned char done;
+int i;
+volatile unsigned char t;
+int s;
+int button;
+int pin_intflag = 0;
+
+// character buffer for holding characters of message to be printed
+char message[];
+int message_i;
+int print_flag = 0;
+char cChar = '0';
+int inc = 1;
+int transmit = 0;
+int get = 0;
+
+//char DATA1[]
 //*****************************************************************************
 //                 GLOBAL VARIABLES -- End
 //*****************************************************************************
 
+#define SPI_IF_BIT_RATE 100000
 
 //****************************************************************************
 //                      LOCAL FUNCTION PROTOTYPES
@@ -170,6 +252,130 @@ static int http_get(int);
 // SimpleLink Asynchronous Event Handlers -- Start
 //*****************************************************************************
 
+static void GPIOA0IntHandler(void) { // pin 61 handler
+    unsigned long ulStatus;
+
+    pin_intflag = 1;
+
+    ulStatus = MAP_GPIOIntStatus (GPIOA0_BASE, true);
+    MAP_GPIOIntClear(GPIOA0_BASE, ulStatus);        // clear interrupts on GPIOA1
+
+    start = TimerValueGet(TIMERA0_BASE, TIMER_A);
+    TimerValueSet(TIMERA0_BASE, TIMER_A, 0);
+
+    // if pulse length is greater than threshold for bit 1 but less than threshold for special character
+    // and if we've seen two interrupts
+    if (start > 200000 && start < 7000000 && s == 2) {
+        checker[i]=1;
+        i++;
+    }
+    // if pulse length is smaller than threshold for 1
+    // and if we've seen two interrupts
+    else if (start < 200000 && s == 2) {
+        checker[i]=0;
+        i++;
+    }
+    else if (start > 7000000) {         // special character
+        s++;
+        // if we've seen 3 interrupts
+        // we are done setting the current button's bit pattern
+        // reset values
+        if(s == 3) {
+            done = 1;
+            i = 0;
+            s = 0;
+        }
+    }
+}
+
+void print_button(void) {
+    int a, b, click;
+
+    for(a = 0; a < 25; a++) {
+        for(b = 0; b < 12; b++) {
+            if(checker[b] != patterns[a][b]) {      // not the current button
+                break;
+            }
+            else if(b == 11) {                      // pattern matched
+                click = a / 2;
+                if(click == 10) {                    // mute
+                    button = 10;
+                    transmit = 1;
+                }
+                else if(click == 11) {
+                    button = 11;                    // last
+                    transmit = 1;
+                }
+                // button 5 doesn't work; use 1 to replace 5's numbers
+                else if(click >= 0 && click <= 9) {
+                    if(click >= 5)
+                        button = click - 1;                 // re-map all buttons greater than 5 to button number one less
+                    else
+                        button = click;
+                    char_i++;
+                    // index 6 == button 7, index 8 = button 9
+                    // case where button represents 4 characters
+                    // reset index when prev button pressed is not the same as current button
+                    if(button != prev_button) {
+                        char_i = 0;
+                    }
+                    else if(char_i == 3 && button != 6 && button != 8) {
+                        char_i = 0;                // reset back to 0 index because we need to print first char of that button again
+                    }
+                    else if(char_i == 4) {
+                        char_i = 0;
+                    }
+                }
+                else
+                    Report("Please press button again. \n\r");
+                click = 0;
+                t = 1;
+                break;
+            }
+        }
+        //want to stop searching through the bit patterns if a match is found
+        if(t == 1) {
+            prev_button = button;
+            break;
+        }
+    }
+
+    inc = 0;
+    Report("%c", letters[button][char_i]);
+}
+
+//prints the specified character onto the terminal
+void print_char() {
+    //cChar = letters[button][char_i];
+}
+
+//timer interrupt handler
+void timer_int_handler(void) {
+    unsigned long status;
+
+    status = TimerIntStatus(TIMERA1_BASE, true);
+    TimerIntClear(TIMERA1_BASE, TIMER_A);
+    TimerIntDisable(TIMERA1_BASE, status);
+    TimerDisable(TIMERA1_BASE, TIMER_A);
+
+//    if(inc == 1) {// && cChar != '0') {
+//        cChar = letters[button][char_i];
+////        Report("button: %d", button);
+//        if(cChar != '0' || cChar != ' ') {
+//            //Report("\r\n buffer: %c\r\n", cChar);
+//            strcpy(message[message_i], cChar);
+//            Report("buffer: %c", message[message_i]);
+//            message_i++;
+//            cChar = '0';
+//        }
+//    }
+
+    get = 1;
+
+    TimerIntEnable(TIMERA1_BASE, TIMER_A);
+    TimerLoadSet(TIMERA1_BASE, TIMER_A, 150000000);
+    TimerEnable(TIMERA1_BASE, TIMER_A);
+}
 
 //*****************************************************************************
 //
@@ -845,8 +1051,11 @@ int connectToAccessPoint() {
 //! \return None
 //!
 //*****************************************************************************
+
 void main() {
+    unsigned long ulStatus;
     long lRetVal = -1;
+    int index = 0;
     //
     // Initialize board configuration
     //
@@ -854,9 +1063,110 @@ void main() {
 
     PinMuxConfig();
 
+    // Enable the SPI module clock
+    MAP_PRCMPeripheralClkEnable(PRCM_GSPI,PRCM_RUN_MODE_CLK);
+
+    // Reset the peripheral
+    MAP_PRCMPeripheralReset(PRCM_GSPI);
+
+    // Reset SPI
+    MAP_SPIReset(GSPI_BASE);
+
+    //initialize modules, configure SPI
+    MAP_SPIConfigSetExpClk(GSPI_BASE,MAP_PRCMPeripheralClockGet(PRCM_GSPI),
+                     SPI_IF_BIT_RATE,SPI_MODE_MASTER,SPI_SUB_MODE_0,
+                     (SPI_SW_CTRL_CS |
+                     SPI_4PIN_MODE |
+                     SPI_TURBO_OFF |
+                     SPI_CS_ACTIVEHIGH |
+                     SPI_WL_8));
+
+    // Enable SPI for communication
+    MAP_SPIEnable(GSPI_BASE);
+    SPICSEnable(GSPI_BASE);
+
+    SPICSDisable(GSPI_BASE);
+
     InitTerm();
     ClearTerm();
     UART_PRINT("Hello world!\n\r");
+
+    start = 0;
+
+    // Configuring the timers
+    Timer_IF_Init(PRCM_TIMERA0, TIMERA0_BASE, TIMER_CFG_PERIODIC_UP, TIMER_A, 255);
+    Timer_IF_Init(PRCM_TIMERA1, TIMERA1_BASE, TIMER_CFG_PERIODIC_UP, TIMER_A, 0);
+
+    // Setup the interrupts for the timer timeouts.
+    Timer_IF_IntSetup(TIMERA1_BASE, TIMER_A, timer_int_handler);
+    TimerLoadSet(TIMERA1_BASE, TIMER_A, 5000);
+
+    // Turn on the timers feeding values in mSec
+    Timer_IF_Start(TIMERA0_BASE, TIMER_A, 4000000000);
+    TimerEnable(TIMERA1_BASE, TIMER_A);
+
+    //
+    // Register the interrupt handlers
+    MAP_GPIOIntRegister(GPIOA0_BASE, GPIOA0IntHandler);
+
+    // Configure rising edge interrupts
+    MAP_GPIOIntTypeSet(GPIOA0_BASE, 0x40, GPIO_FALLING_EDGE);
+
+    ulStatus = MAP_GPIOIntStatus (GPIOA0_BASE, true);
+    MAP_GPIOIntClear(GPIOA0_BASE, ulStatus);
+
+    pin_intflag = 0;
+    //pin_intcount = 0;
+
+    done = 0;
+    i = 0;
+    t = 0;
+    s = 1;
+    char_i = -1;
+    prev_button = -1;
+    message_i = 0;
+
+    MAP_GPIOIntEnable(GPIOA0_BASE, 0x40);
+
+    TimerValueSet(TIMERA0_BASE, TIMER_A, 0);
+
+    while (!transmit) {
+            while (pin_intflag==0) {;}
+            if (pin_intflag) {
+                pin_intflag=0;
+            }
+            if(done) {
+                print_button();
+                print_char();
+                inc = 1;
+                done = 0;
+                t = 0;
+                i = 0;
+            }
+
+            if(get) {
+                cChar = letters[button][char_i];
+                if(cChar != '\0' && cChar != '0') {
+                    message[message_i] = cChar;
+                    message_i++;
+                }
+                get = 0;
+            }
+            if(transmit == 1) {
+                message[message_i] = '\0';
+                Report("\r\n");
+                for(index = 0; index < message_i; index++) {
+                    Report("%c", message[index]);
+                }
+                Report("\r\n");
+//                transmit = 0;
+            }
+
+        }
+    message[message_i] = '\0';
+    Report("buffer: ");
+    Report("%s\r\n", message);
+    transmit = 0;
 
     //Connect the CC3200 to the local access point
     lRetVal = connectToAccessPoint();
@@ -900,7 +1210,7 @@ static int http_post(int iTLSSockID){
     pcBufHeaders += strlen(CHEADER);
     strcpy(pcBufHeaders, "\r\n\r\n");
 
-    int dataLength = strlen(DATA1);
+    int dataLength = strlen(DATA1)+strlen(message)+strlen(DATA2);
 
     strcpy(pcBufHeaders, CTHEADER);
     pcBufHeaders += strlen(CTHEADER);
@@ -916,6 +1226,12 @@ static int http_post(int iTLSSockID){
 
     strcpy(pcBufHeaders, DATA1);
     pcBufHeaders += strlen(DATA1);
+
+    strcpy(pcBufHeaders, message);
+    pcBufHeaders += strlen(message);
+
+    strcpy(pcBufHeaders, DATA2);
+    pcBufHeaders += strlen(DATA2);
 
     int testDataLength = strlen(pcBufHeaders);
 
@@ -1011,3 +1327,6 @@ static int http_get(int iTLSSockID){
 
     return 0;
 }
+
+// decode function
+// GPIO interrupt handler
